@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>Ed25519ph Streaming Sign (libsodium + Web APIs)</title>
+
+<h1>Ed25519ph streaming sign</h1>
+
+<section>
+  <button id="gen">Generate Ed25519 key pair</button><br>
+  <label>Public key (base64)</label><br>
+  <textarea id="pub" rows="3" cols="80" readonly></textarea><br>
+  <label>Secret key (base64)</label><br>
+  <textarea id="sec" rows="5" cols="80" readonly></textarea>
+</section>
+
+<hr>
+
+<section>
+  <input id="file" type="file" />
+  <button id="sign">Sign file with Ed25519ph</button><br>
+  <label>Signature (base64)</label><br>
+  <textarea id="sig" rows="3" cols="80" readonly></textarea>
+</section>
+
+<script type="module">
+/*
+  Internal logic (pure). Uses:
+  - libsodium for Ed25519ph streaming sign
+  - Web Crypto getRandomValues for seed generation
+  - Blob.stream() + reader for backpressure-friendly chunking
+*/
+import sodium from "https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.13/dist/modules/libsodium-wrappers.js";
+
+const Logic = (() => {
+  let S; // bound libsodium instance
+
+  async function init() {
+    await sodium.ready;
+    S = sodium;
+  }
+
+  // Generate Ed25519 key pair using a Web Crypto CSPRNG seed (shows built-in API usage).
+  function genKeyPairB64() {
+    const seed = crypto.getRandomValues(new Uint8Array(S.crypto_sign_SEEDBYTES));
+    const { publicKey, privateKey } = S.crypto_sign_seed_keypair(seed);
+    return {
+      publicKey_b64: S.to_base64(publicKey, S.base64_variants.ORIGINAL),
+      secretKey_b64: S.to_base64(privateKey, S.base64_variants.ORIGINAL),
+    };
+  }
+
+  // Stream-sign a File using Ed25519ph (SHA-512 prehash). Avoids loading entire file in memory.
+  async function signFileEd25519phB64(file, secretKey_b64) {
+    const sk = S.from_base64(secretKey_b64, S.base64_variants.ORIGINAL);
+
+    // Ed25519ph streaming: init → update* → final_create
+    const state = S.crypto_sign_init(); // libsodium's streaming API implements the *ph variant
+    const reader = file.stream().getReader();
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        // value is a Uint8Array chunk; update prehash state
+        S.crypto_sign_update(state, value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const sig = S.crypto_sign_final_create(state, sk);
+    return S.to_base64(sig, S.base64_variants.ORIGINAL);
+  }
+
+  return { init, genKeyPairB64, signFileEd25519phB64 };
+})();
+
+/* Minimal DOM wire-up. No crypto in handlers. */
+await Logic.init();
+
+const $ = id => document.getElementById(id);
+
+$("gen").addEventListener("click", () => {
+  const kp = Logic.genKeyPairB64();
+  $("pub").value = kp.publicKey_b64;
+  $("sec").value = kp.secretKey_b64;
+});
+
+$("sign").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { alert("Choose a file first"); return; }
+  const sk = $("sec").value.trim();
+  if (!sk) { alert("Generate keys first"); return; }
+
+  try {
+    const sigB64 = await Logic.signFileEd25519phB64(f, sk);
+    $("sig").value = sigB64;
+  } catch (e) {
+    console.error(e);
+    alert("Signing failed. See console for details.");
+  }
+});
+</script>
+</html>
