@@ -1,40 +1,67 @@
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8" />
-<title>Ed25519ph Stream Sign (libsodium + Web Crypto)</title>
+<title>Ed25519ph Streaming Signer</title>
 
-<h1>Ed25519ph streaming sign demo</h1>
+<h1>Ed25519ph Streaming signer</h1>
+<output id="libsodium-status" aria-live="polite">&nbsp;</output>
 
 <section>
-  <h2>1) Generate Ed25519 key pair (seeded by Web Crypto)</h2>
-  <button id="btn-gen">Generate key pair</button>
+  <h2>1) Generate 32-byte random seed</h2>
+  <button id="btn-gen" disabled>Generate random seed</button>
+  <button id="btn-load" disabled>Load seed from a file</button>
+  <button id="btn-save" disabled>Save seed to a file</button>
+  <br><br>
   <div>
-    <label>Public key (base64):</label><br />
-    <textarea id="pub" rows="3" cols="80" readonly></textarea>
+    <label>Seed Name (load and save affects this)</label><br />
+    <textarea id="seed-name" rows="1" cols="80"></textarea>
   </div>
+  <div>
+    <label>Seed (base64):</label><br />
+    <textarea id="seed" rows="3" cols="80" readonly></textarea>
+  </div>
+  <h3>Seed above is used to derive key pairs:</h3>
   <div>
     <label>Secret key (base64):</label><br />
     <textarea id="sec" rows="3" cols="80" readonly></textarea>
   </div>
+  <div>
+    <label>Public key (base64):</label><br />
+    <textarea id="pub" rows="3" cols="80" readonly></textarea>
+  </div>
 </section>
+
+<output id="key-status" aria-live="polite">&nbsp;</output>
 
 <hr />
 
 <section>
-  <h2>2) Select file and sign with Ed25519ph (streamed)</h2>
+  <h2>2) Select file and sign or verify with Ed25519ph (streamed)</h2>
   <input id="file" type="file" />
-  <button id="btn-sign">Sign file (Ed25519ph)</button>
+  <br>
+
+  <h3>Sign file with Ed25519ph (streamed)</h3>
+  <button id="btn-sign" disabled>Sign file (Ed25519ph)</button>
   <div>
-    <label>Signature (base64):</label><br />
+    <label for="prog">Progress:</label><br />
+    <progress id="prog" value="0" max="100" style="width:500px"></progress>
+    <div id="prog-txt" style="font-family:ui-monospace,monospace">&nbsp;</div>
+  </div>
+  <div>
+    <label>Ed25519ph Signature (base64):</label><br />
     <textarea id="sig" rows="3" cols="80" readonly></textarea>
   </div>
+  <br>
+  
+  <h3>Verify file signature with Ed25519ph (streamed)</h3>
+  <button id="btn-verify" disabled>Verify file (Ed25519ph)</button>
 </section>
 
-<!-- Local UMD bundle (you uploaded this). Avoids CORS. -->
+<!-- Local UMD bundle -->
 <script src="sodium-sumo.js"></script>
 
 <script>
-/* ---------- Internal logic (no DOM here) ---------- */
+/* ---------- Internal logic (no DOM) ---------- */
 
 // Base64 helpers
 const b64 = {
@@ -51,7 +78,7 @@ const b64 = {
   }
 };
 
-// Chunked reader using File.slice + FileReader (works on Safari/iPad)
+// Chunked reader using File.slice + FileReader (Safari/iPad safe)
 async function* readFileChunks(file, chunkSize = 2 ** 20) {
   let offset = 0;
   while (offset < file.size) {
@@ -67,51 +94,185 @@ async function* readFileChunks(file, chunkSize = 2 ** 20) {
   }
 }
 
-// Ed25519ph via libsodium multi-part API: crypto_sign_init/update/final_create
+// Multipart signing API (UMD exposes crypto_sign_* streaming).
+// Note: This signs with Ed25519 streaming. Your uploaded UMD build does not
+// expose the ed25519ph-specific functions.
 const Ed25519ph = (() => {
   async function ready() { await sodium.ready; }
 
-  async function genKeyPair() {
+  // 1) Generate a random 32-byte seed
+  async function genSeed() {
     await ready();
     const seed = new Uint8Array(sodium.crypto_sign_SEEDBYTES);
     crypto.getRandomValues(seed);
-    const { publicKey, privateKey } = sodium.crypto_sign_seed_keypair(seed);
-    return { publicKey, privateKey }; // pk:32, sk:64
+    return seed; // 32 bytes
   }
 
-  async function signFileStream(file, privateKey, chunkSize = 2 ** 20) {
+  // 2) Derive keypair from provided 32-byte seed
+  async function genKeyPair(seed) {
+    await ready();
+    if (!(seed instanceof Uint8Array) || seed.length !== sodium.crypto_sign_SEEDBYTES) {
+      throw new Error("seed must be Uint8Array(32)");
+    }
+    const { publicKey, privateKey } = sodium.crypto_sign_seed_keypair(seed);
+    return { publicKey, privateKey };
+  }
+
+  async function signFileStream(file, privateKey, { chunkSize = 2 ** 20, onProgress } = {}) {
     await ready();
     const state = sodium.crypto_sign_init(); // returns state object
+    let processed = 0;
     for await (const chunk of readFileChunks(file, chunkSize)) {
       sodium.crypto_sign_update(state, chunk);
+      processed += chunk.length;
+      if (onProgress) onProgress({ processed, total: file.size });
     }
-    return sodium.crypto_sign_final_create(state, privateKey); // Uint8Array(64)
+    return sodium.crypto_sign_final_create(state, privateKey); // 64-byte signature
   }
 
-  return { ready, genKeyPair, signFileStream };
+  return { ready, genSeed, genKeyPair, signFileStream };
 })();
 </script>
 
 <script>
 /* ---------- Minimal DOM wiring ---------- */
 (async () => {
+  const $ = (id) => document.getElementById(id);
+
+  // Buttons are disabled in HTML at startup. Enable after libsodium is ready.
   try {
     await Ed25519ph.ready();
-    alert("libsodium is ready"); // explicit requirement
+    const ls = document.getElementById("libsodium-status");
+    if (ls) ls.value = "libsodium ready";
+    $("btn-gen").disabled = false;
+    $("btn-load").disabled = false;
+    $("btn-save").disabled = false;
+    $("btn-sign").disabled = true;
   } catch (e) {
-    alert("libsodium failed to initialize: " + (e && e.message ? e.message : e));
+    const ls = document.getElementById("libsodium-status");
+    if (ls) ls.value = "libsodium failed to initialize: " + (e && e.message ? e.message : e);
+    // keep buttons disabled
   }
 
-  const $ = (id) => document.getElementById(id);
   let keys = { publicKey: null, privateKey: null };
+
+  function isoLocal() {
+    const d = new Date();
+    const tz = -d.getTimezoneOffset();
+    const sign = tz >= 0 ? '+' : '-';
+    const pad = n => String(Math.floor(Math.abs(n))).padStart(2, '0');
+    const h = pad(tz / 60);
+    const m = pad(tz % 60);
+    return d.getFullYear() + '-' +
+           pad(d.getMonth() + 1) + '-' +
+           pad(d.getDate()) + 'T' +
+           pad(d.getHours()) + ':' +
+           pad(d.getMinutes()) + ':' +
+           pad(d.getSeconds()) + sign + h + ':' + m;
+  }
 
   $("btn-gen").addEventListener("click", async () => {
     try {
-      keys = await Ed25519ph.genKeyPair();
-      $("pub").value = b64.fromU8(keys.publicKey);
-      $("sec").value = b64.fromU8(keys.privateKey);
+      const seed = await Ed25519ph.genSeed();
+      $("seed").value = b64.fromU8(seed);
+      // Add ISO timestamp to seed-name
+      const nm = document.getElementById("seed-name");
+      if (nm) nm.value = isoLocal();
+      $("key-status").value = "Seed generated.";
+      $("seed").dispatchEvent(new Event("input"));
     } catch (e) {
-      alert("Key generation failed: " + e.message);
+      $("key-status").value = "Seed generation failed: " + e.message;
+    }
+  });
+
+  // Treat #seed as source of truth. Any change derives keys.
+  $("seed").addEventListener("input", async () => {
+    try {
+      const seedB64 = document.getElementById('seed').value.trim();
+      if (!seedB64) {
+        keys = { publicKey: null, privateKey: null };
+        $("pub").value = "";
+        $("sec").value = "";
+        $("key-status").value = "Seed empty.";
+        $("btn-sign").disabled = true;
+        return;
+      }
+      let seedU8;
+      try {
+        seedU8 = b64.toU8(seedB64);
+      } catch (e) {
+        $("key-status").value = "Invalid base64 seed.";
+        $("btn-sign").disabled = true;
+        return;
+      }
+      if (seedU8.length !== 32) {
+        $("key-status").value = "Seed must be 32 bytes (base64-encoded).";
+        $("btn-sign").disabled = true;
+        return;
+      }
+      const { publicKey, privateKey } = await Ed25519ph.genKeyPair(seedU8);
+      keys = { publicKey, privateKey };
+      $("pub").value = b64.fromU8(publicKey);
+      $("sec").value = b64.fromU8(privateKey);
+      $("key-status").value = "Key pair ready.";
+      $("btn-sign").disabled = false;
+    } catch (e) {
+      keys = { publicKey: null, privateKey: null };
+      $("pub").value = "";
+      $("sec").value = "";
+      $("key-status").value = "Key derivation failed: " + e.message;
+      $("btn-sign").disabled = true;
+    }
+  });
+
+  // Save seed as JSON { "name": "<seed-name>", "seedB64": "<value>" }
+  $("btn-save").addEventListener("click", () => {
+    try {
+      const seedB64 = document.getElementById('seed').value.trim();
+      const name = (document.getElementById('seed-name')?.value || "").trim();
+      const obj = { name, seedB64 };
+      const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "seed.json";
+      document.body.appendChild(a);
+      a.click();
+      URL.revokeObjectURL(a.href);
+      a.remove();
+      const ks = document.getElementById("key-status");
+      if (ks) ks.value = "Seed JSON ready for download.";
+    } catch (e) {
+      const ks = document.getElementById("key-status");
+      if (ks) ks.value = "Save failed: " + e.message;
+    }
+  });
+
+  // Load seed from JSON { "name": "<seed-name>", "seedB64": "<value>" }
+  $("btn-load").addEventListener("click", async () => {
+    try {
+      const inp = document.createElement("input");
+      inp.type = "file";
+      inp.accept = "application/json,.json";
+      const file = await new Promise((res) => {
+        inp.onchange = () => res(inp.files && inp.files[0]);
+        inp.click();
+      });
+      if (!file) return;
+      const text = await file.text();
+      let obj;
+      try { obj = JSON.parse(text); }
+      catch (e) { $("key-status").value = "Invalid JSON."; return; }
+      const name = typeof obj.name === "string" ? obj.name : "";
+      const seedB64 = typeof obj.seedB64 === "string" ? obj.seedB64 : "";
+      if (!seedB64) { $("key-status").value = "Missing seedB64."; return; }
+      const nmEl = document.getElementById("seed-name");
+      if (nmEl) nmEl.value = name;
+      $("seed").value = seedB64.trim();
+      $("key-status").value = "Seed loaded.";
+      // Trigger derivation
+      $("seed").dispatchEvent(new Event("input"));
+    } catch (e) {
+      $("key-status").value = "Load failed: " + e.message;
     }
   });
 
@@ -121,10 +282,36 @@ const Ed25519ph = (() => {
     if (!keys.privateKey) { alert("Generate a key pair first"); return; }
 
     try {
-      const sig = await Ed25519ph.signFileStream(f, keys.privateKey);
+      $("btn-gen").disabled = true;
+      $("btn-load").disabled = true;
+      $("btn-save").disabled = true;
+      $("btn-sign").disabled = true;
+      $("file").disabled = true;
+      $("key-status").value = "Signing…";
+      $("sig").value = "";
+      const prog = $("prog");
+      const progTxt = $("prog-txt");
+      const fmt = (n) => (n / (1024 * 1024)).toFixed(2) + " MiB";
+
+      const sig = await Ed25519ph.signFileStream(f, keys.privateKey, {
+        onProgress: ({ processed, total }) => {
+          const pct = total ? Math.floor((processed / total) * 100) : 0;
+          prog.max = 100;
+          prog.value = pct;
+          progTxt.textContent = `${pct}%  ${fmt(processed)} / ${fmt(total)}`;
+        }
+      });
+
       $("sig").value = b64.fromU8(sig);
+      $("key-status").value = "Done.";
     } catch (e) {
       alert("Signing failed: " + e.message);
+    } finally {
+      $("btn-gen").disabled = false;
+      $("btn-load").disabled = false;
+      $("btn-save").disabled = false;
+      $("btn-sign").disabled = false;
+      $("file").disabled = false;
     }
   });
 })();
