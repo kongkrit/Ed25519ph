@@ -1,104 +1,132 @@
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8" />
-<title>Ed25519ph Streaming Sign (libsodium + Web APIs)</title>
+<title>Ed25519ph Stream Sign (libsodium + Web Crypto)</title>
 
-<h1>Ed25519ph streaming sign</h1>
+<h1>Ed25519ph streaming sign demo</h1>
 
 <section>
-  <button id="gen">Generate Ed25519 key pair</button><br>
-  <label>Public key (base64)</label><br>
-  <textarea id="pub" rows="3" cols="80" readonly></textarea><br>
-  <label>Secret key (base64)</label><br>
-  <textarea id="sec" rows="5" cols="80" readonly></textarea>
+  <h2>1) Generate Ed25519 key pair (seeded by Web Crypto)</h2>
+  <button id="btn-gen">Generate key pair</button>
+  <div>
+    <label>Public key (base64):</label><br />
+    <textarea id="pub" rows="3" cols="80" readonly></textarea>
+  </div>
+  <div>
+    <label>Secret key (base64):</label><br />
+    <textarea id="sec" rows="3" cols="80" readonly></textarea>
+  </div>
 </section>
 
-<hr>
+<hr />
 
 <section>
+  <h2>2) Select file and sign with Ed25519ph (streamed)</h2>
   <input id="file" type="file" />
-  <button id="sign">Sign file with Ed25519ph</button><br>
-  <label>Signature (base64)</label><br>
-  <textarea id="sig" rows="3" cols="80" readonly></textarea>
+  <button id="btn-sign">Sign file (Ed25519ph)</button>
+  <div>
+    <label>Signature (base64):</label><br />
+    <textarea id="sig" rows="3" cols="80" readonly></textarea>
+  </div>
 </section>
 
-<script type="module">
-/*
-  Internal logic (pure). Uses:
-  - libsodium for Ed25519ph streaming sign
-  - Web Crypto getRandomValues for seed generation
-  - Blob.stream() + reader for backpressure-friendly chunking
-*/
-import sodium from "https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.13/dist/modules/libsodium-wrappers.js";
+<!-- Local UMD bundle (you uploaded this). Avoids CORS. -->
+<script src="sodium-sumo.js"></script>
 
-const Logic = (() => {
-  let S; // bound libsodium instance
+<script>
+/* ---------- Internal logic (no DOM here) ---------- */
 
-  async function init() {
-    await sodium.ready;
-    S = sodium;
+// Base64 helpers
+const b64 = {
+  fromU8(u8) {
+    let bin = "";
+    for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    return btoa(bin);
+  },
+  toU8(s) {
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+};
+
+// Chunked reader using File.slice + FileReader (works on Safari/iPad)
+async function* readFileChunks(file, chunkSize = 2 ** 20) {
+  let offset = 0;
+  while (offset < file.size) {
+    const slice = file.slice(offset, offset + chunkSize);
+    const buf = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onerror = () => rej(fr.error);
+      fr.onload = () => res(fr.result);
+      fr.readAsArrayBuffer(slice);
+    });
+    yield new Uint8Array(buf);
+    offset += chunkSize;
+  }
+}
+
+// Ed25519ph via libsodium multi-part API: crypto_sign_init/update/final_create
+const Ed25519ph = (() => {
+  async function ready() { await sodium.ready; }
+
+  async function genKeyPair() {
+    await ready();
+    const seed = new Uint8Array(sodium.crypto_sign_SEEDBYTES);
+    crypto.getRandomValues(seed);
+    const { publicKey, privateKey } = sodium.crypto_sign_seed_keypair(seed);
+    return { publicKey, privateKey }; // pk:32, sk:64
   }
 
-  // Generate Ed25519 key pair using a Web Crypto CSPRNG seed (shows built-in API usage).
-  function genKeyPairB64() {
-    const seed = crypto.getRandomValues(new Uint8Array(S.crypto_sign_SEEDBYTES));
-    const { publicKey, privateKey } = S.crypto_sign_seed_keypair(seed);
-    return {
-      publicKey_b64: S.to_base64(publicKey, S.base64_variants.ORIGINAL),
-      secretKey_b64: S.to_base64(privateKey, S.base64_variants.ORIGINAL),
-    };
+  async function signFileStream(file, privateKey, chunkSize = 2 ** 20) {
+    await ready();
+    const state = sodium.crypto_sign_init(); // returns state object
+    for await (const chunk of readFileChunks(file, chunkSize)) {
+      sodium.crypto_sign_update(state, chunk);
+    }
+    return sodium.crypto_sign_final_create(state, privateKey); // Uint8Array(64)
   }
 
-  // Stream-sign a File using Ed25519ph (SHA-512 prehash). Avoids loading entire file in memory.
-  async function signFileEd25519phB64(file, secretKey_b64) {
-    const sk = S.from_base64(secretKey_b64, S.base64_variants.ORIGINAL);
+  return { ready, genKeyPair, signFileStream };
+})();
+</script>
 
-    // Ed25519ph streaming: init → update* → final_create
-    const state = S.crypto_sign_init(); // libsodium's streaming API implements the *ph variant
-    const reader = file.stream().getReader();
+<script>
+/* ---------- Minimal DOM wiring ---------- */
+(async () => {
+  try {
+    await Ed25519ph.ready();
+    alert("libsodium is ready"); // explicit requirement
+  } catch (e) {
+    alert("libsodium failed to initialize: " + (e && e.message ? e.message : e));
+  }
+
+  const $ = (id) => document.getElementById(id);
+  let keys = { publicKey: null, privateKey: null };
+
+  $("btn-gen").addEventListener("click", async () => {
+    try {
+      keys = await Ed25519ph.genKeyPair();
+      $("pub").value = b64.fromU8(keys.publicKey);
+      $("sec").value = b64.fromU8(keys.privateKey);
+    } catch (e) {
+      alert("Key generation failed: " + e.message);
+    }
+  });
+
+  $("btn-sign").addEventListener("click", async () => {
+    const f = $("file").files && $("file").files[0];
+    if (!f) { alert("Select a file first"); return; }
+    if (!keys.privateKey) { alert("Generate a key pair first"); return; }
 
     try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        // value is a Uint8Array chunk; update prehash state
-        S.crypto_sign_update(state, value);
-      }
-    } finally {
-      reader.releaseLock();
+      const sig = await Ed25519ph.signFileStream(f, keys.privateKey);
+      $("sig").value = b64.fromU8(sig);
+    } catch (e) {
+      alert("Signing failed: " + e.message);
     }
-
-    const sig = S.crypto_sign_final_create(state, sk);
-    return S.to_base64(sig, S.base64_variants.ORIGINAL);
-  }
-
-  return { init, genKeyPairB64, signFileEd25519phB64 };
+  });
 })();
-
-/* Minimal DOM wire-up. No crypto in handlers. */
-await Logic.init();
-
-const $ = id => document.getElementById(id);
-
-$("gen").addEventListener("click", () => {
-  const kp = Logic.genKeyPairB64();
-  $("pub").value = kp.publicKey_b64;
-  $("sec").value = kp.secretKey_b64;
-});
-
-$("sign").addEventListener("click", async () => {
-  const f = $("file").files[0];
-  if (!f) { alert("Choose a file first"); return; }
-  const sk = $("sec").value.trim();
-  if (!sk) { alert("Generate keys first"); return; }
-
-  try {
-    const sigB64 = await Logic.signFileEd25519phB64(f, sk);
-    $("sig").value = sigB64;
-  } catch (e) {
-    console.error(e);
-    alert("Signing failed. See console for details.");
-  }
-});
 </script>
 </html>
