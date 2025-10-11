@@ -35,9 +35,8 @@
     <label>Public key (base64):</label><br />
     <textarea id="pub" rows="3" cols="80" readonly></textarea>
   </div>
+  <output id="key-status" aria-live="polite">&nbsp;</output>
 </section>
-
-<output id="key-status" aria-live="polite">&nbsp;</output>
 
 <hr />
 
@@ -45,14 +44,15 @@
   <h2>2) Select file and sign or verify with Ed25519ph (streamed)</h2>
   <input id="file" type="file" />
   <br>
-
-  <h3>Sign file with Ed25519ph (streamed)</h3>
-  <button id="btn-sign" disabled>Sign file (Ed25519ph)</button>
   <div>
     <label for="prog">Progress:</label><br />
     <progress id="prog" value="0" max="100" style="width:500px"></progress>
     <div id="prog-txt" style="font-family:ui-monospace,monospace">&nbsp;</div>
   </div>
+
+  <h3>Sign file with Ed25519ph (streamed)</h3>
+  <button id="btn-sign" disabled>Sign file (Ed25519ph)</button>
+
   <div>
     <label>Ed25519ph Signature (base64):</label><br />
     <textarea id="sig" rows="3" cols="80" readonly></textarea>
@@ -61,6 +61,12 @@
   
   <h3>Verify file signature with Ed25519ph (streamed)</h3>
   <button id="btn-verify" disabled>Verify file (Ed25519ph)</button>
+  
+  <div>
+    <label>Verification result:</label><br />
+    <textarea id="ver" rows="3" cols="80" readonly></textarea>
+  </div>
+  <br>
 </section>
 
 <!-- Local UMD bundle -->
@@ -124,19 +130,28 @@ const Ed25519ph = (() => {
     return { publicKey, privateKey };
   }
 
-  async function signFileStream(file, privateKey, { chunkSize = 2 ** 20, onProgress } = {}) {
-    await ready();
-    const state = sodium.crypto_sign_init(); // returns state object
-    let processed = 0;
-    for await (const chunk of readFileChunks(file, chunkSize)) {
-      sodium.crypto_sign_update(state, chunk);
-      processed += chunk.length;
-      if (onProgress) onProgress({ processed, total: file.size });
-    }
-    return sodium.crypto_sign_final_create(state, privateKey); // 64-byte signature
+  async function signOrVerifyStream(mode, file, privateKey, publicKey, signatureToValidate, { chunkSize = 2 ** 20, onProgress } = {}) {
+  await ready();
+  const state = sodium.crypto_sign_init(); // streaming state
+  let processed = 0;
+  for await (const chunk of readFileChunks(file, chunkSize)) {
+    sodium.crypto_sign_update(state, chunk);
+    processed += chunk.length;
+    if (onProgress) onProgress({ processed, total: file.size });
   }
+  if (mode === "sign") {
+    if (!privateKey) throw new Error("privateKey required for sign");
+    return sodium.crypto_sign_final_create(state, privateKey); // Uint8Array(64)
+  } else if (mode === "verify") {
+    if (!publicKey) throw new Error("publicKey required for verify");
+    if (!(signatureToValidate instanceof Uint8Array)) throw new Error("signatureToValidate must be Uint8Array");
+    const ok = sodium.crypto_sign_final_verify(state, signatureToValidate, publicKey);
+    return ok === true; // boolean
+  }
+  throw new Error("Unknown mode: " + mode);
+}
 
-  return { ready, genSeed, genKeyPair, signFileStream };
+return { ready, genSeed, genKeyPair, signOrVerifyStream };
 })();
 </script>
 
@@ -145,16 +160,64 @@ const Ed25519ph = (() => {
 (async () => {
   const $ = (id) => document.getElementById(id);
 
+
+let libsodiumReady = false; // set true after first successful Ed25519ph.ready()
+
+function updateControls() {
+  // Do nothing until libsodium is ready
+  if (!libsodiumReady) return;
+  const hasFile = !!($("file") && $("file").files && $("file").files.length > 0);
+  const secVal = ($("sec")?.value || "").trim();
+  const pubVal = ($("pub")?.value || "").trim();
+  const sigVal = ($("sig")?.value || "").trim();
+
+  // Base enables after libsodium becomes ready
+  $("btn-gen").disabled = false;
+  $("btn-load").disabled = false;
+  $("btn-save").disabled = false;
+  $("file").disabled = false;
+
+  // Conditional enables
+  $("btn-sign").disabled = !(hasFile && secVal !== "");
+  $("btn-verify").disabled = !(hasFile && pubVal !== "" && sigVal !== "");
+}
+
+
+async function withProgress(statusLabel, run) {
+  $("btn-gen").disabled = true;
+  $("btn-load").disabled = true;
+  $("btn-save").disabled = true;
+  $("btn-sign").disabled = true;
+  $("btn-verify").disabled = true;
+  $("file").disabled = true;
+  $("key-status").value = statusLabel;
+  const prog = $("prog");
+  const progTxt = $("prog-txt");
+  const fmt = (n) => (n / (1024 * 1024)).toFixed(2) + " MiB";
+  const onProgress = ({ processed, total }) => {
+    const pct = total ? Math.floor((processed / total) * 100) : 0;
+    prog.max = 100;
+    prog.value = pct;
+    progTxt.textContent = `${pct}%  ${fmt(processed)} / ${fmt(total)}`;
+  };
+  try {
+    const result = await run(onProgress);
+    $("key-status").value = "Done.";
+    return result;
+  }
+  finally {
+    updateControls();
+  }
+}
+
   // Buttons are disabled in HTML at startup. Enable after libsodium is ready.
   try {
     await Ed25519ph.ready();
+    libsodiumReady = true;
     const ls = document.getElementById("libsodium-status");
     if (ls) ls.value = "libsodium ready";
-    $("btn-gen").disabled = false;
-    $("btn-load").disabled = false;
-    $("btn-save").disabled = false;
-    $("btn-sign").disabled = true;
-  } catch (e) {
+    updateControls();
+    } catch (e) {
     const ls = document.getElementById("libsodium-status");
     if (ls) ls.value = "libsodium failed to initialize: " + (e && e.message ? e.message : e);
     // keep buttons disabled
@@ -200,7 +263,7 @@ const Ed25519ph = (() => {
         $("pub").value = "";
         $("sec").value = "";
         $("key-status").value = "Seed empty.";
-        $("btn-sign").disabled = true;
+        updateControls();
         return;
       }
       let seedU8;
@@ -208,12 +271,12 @@ const Ed25519ph = (() => {
         seedU8 = b64.toU8(seedB64);
       } catch (e) {
         $("key-status").value = "Invalid base64 seed.";
-        $("btn-sign").disabled = true;
+        updateControls();
         return;
       }
       if (seedU8.length !== 32) {
         $("key-status").value = "Seed must be 32 bytes (base64-encoded).";
-        $("btn-sign").disabled = true;
+        updateControls();
         return;
       }
       const { publicKey, privateKey } = await Ed25519ph.genKeyPair(seedU8);
@@ -221,13 +284,13 @@ const Ed25519ph = (() => {
       $("pub").value = b64.fromU8(publicKey);
       $("sec").value = b64.fromU8(privateKey);
       $("key-status").value = "Key pair ready.";
-      $("btn-sign").disabled = false;
+      updateControls();
     } catch (e) {
       keys = { publicKey: null, privateKey: null };
       $("pub").value = "";
       $("sec").value = "";
       $("key-status").value = "Key derivation failed: " + e.message;
-      $("btn-sign").disabled = true;
+      updateControls();
     }
   });
 
@@ -279,47 +342,52 @@ const Ed25519ph = (() => {
       $("seed").dispatchEvent(new Event("input"));
     } catch (e) {
       $("key-status").value = "Load failed: " + e.message;
-    }
-  });
+    }});
+
+  
+
+// Keep buttons in sync with inputs
+$("file").addEventListener("change", () => {
+  $("sig").value = "";
+  $("ver").value = "";
+  updateControls();
+});
+$("sig").addEventListener("input", () => updateControls());
 
   $("btn-sign").addEventListener("click", async () => {
-    const f = $("file").files && $("file").files[0];
-    if (!f) { alert("Select a file first"); return; }
-    if (!keys.privateKey) { alert("Generate a key pair first"); return; }
-
-    try {
-      $("btn-gen").disabled = true;
-      $("btn-load").disabled = true;
-      $("btn-save").disabled = true;
-      $("btn-sign").disabled = true;
-      $("file").disabled = true;
-      $("key-status").value = "Signing…";
-      $("sig").value = "";
-      const prog = $("prog");
-      const progTxt = $("prog-txt");
-      const fmt = (n) => (n / (1024 * 1024)).toFixed(2) + " MiB";
-
-      const sig = await Ed25519ph.signFileStream(f, keys.privateKey, {
-        onProgress: ({ processed, total }) => {
-          const pct = total ? Math.floor((processed / total) * 100) : 0;
-          prog.max = 100;
-          prog.value = pct;
-          progTxt.textContent = `${pct}%  ${fmt(processed)} / ${fmt(total)}`;
-        }
-      });
-
-      $("sig").value = b64.fromU8(sig);
-      $("key-status").value = "Done.";
-    } catch (e) {
-      alert("Signing failed: " + e.message);
-    } finally {
-      $("btn-gen").disabled = false;
-      $("btn-load").disabled = false;
-      $("btn-save").disabled = false;
-      $("btn-sign").disabled = false;
-      $("file").disabled = false;
-    }
-  });
+  const f = $("file").files && $("file").files[0];
+  if (!f) { alert("Select a file first"); return; }
+  if (!keys.privateKey) { alert("Generate a key pair first"); return; }
+  try {
+    $("sig").value = "";
+    const sig = await withProgress("Signing…", (onProgress) =>
+      Ed25519ph.signOrVerifyStream("sign", f, keys.privateKey, null, null, { onProgress })
+    );
+    $("sig").value = b64.fromU8(sig);
+    updateControls();
+  } catch (e) {
+    alert("Signing failed: " + e.message);
+  }
+});
+$("btn-verify").addEventListener("click", async () => {
+  const f = $("file").files && $("file").files[0];
+  if (!f) { alert("Select a file first"); return; }
+  if (!keys.publicKey) { alert("Generate or load a public key first"); return; }
+  const sigB64 = $("sig").value.trim();
+  if (!sigB64) { alert("Provide a base64 signature in the Signature field"); return; }
+  let sigU8;
+  try { sigU8 = b64.toU8(sigB64); } catch (e) { alert("Invalid base64 signature"); return; }
+  try {
+    $("ver").value = "";
+    const ok = await withProgress("Verifying…", (onProgress) =>
+      Ed25519ph.signOrVerifyStream("verify", f, null, keys.publicKey, sigU8, { onProgress })
+    );
+    $("ver").value = ok ? "OK" : "BAD";
+  } catch (e) {
+    alert("Verify failed: " + e.message);
+  }
+});
 })();
+
 </script>
 </html>
